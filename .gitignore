@@ -1,0 +1,10 @@
+/datasets
+img_*
+seg_*
+
+/tumkatalog
+/models
+/logs
+/graphics
+
+train_*
