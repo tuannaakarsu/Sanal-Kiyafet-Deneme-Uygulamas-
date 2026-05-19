@@ -1,105 +1,88 @@
-""" ---> moedlin mimarisinin bulunduğu dosya. Bu dosyanın amacı model mimarisinde herhangi bir sorun oluşması dahilinde
-kod yapısının uzun satıları arasında sorunu arayıp, yapıyı bozarak değişiklikler yapmak yerine kendi içinde kolayca
-düzenlemektir."""
-
+import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 
 
-"""---> temel yapı bloğu. batchnormalizasyonu eğitimi daha hızlı yapabilmek amacıyla aktivasyon fonk. destek için kullandım. 
-relu fonksiyonu yaygın kullanılan doğrusal olmayan bir aktivasyon fonk."""
-
-class DoubleConvolution(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int):
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
-        self.first = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.batchN2 = nn.BatchNorm2d(out_channels)
-        self.act1 = nn.ReLU()
-
-        self.second = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.act2 = nn.ReLU()
-
-    def forward(self, x:torch.Tensor):
-        x = self.first(x)
-        x = self.batchN2(x)
-        x = self.act1(x)
-        x = self.second(x)
-        return self.act2(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
-
-class DownSample(nn.Module):
-    def __init__(self):
+class Down(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
+        self.conv = ConvBlock(in_ch, out_ch)
         self.pool = nn.MaxPool2d(2)
 
-    def forward(self, x:torch.Tensor):
-        return self.pool(x)
+    def forward(self, x: torch.Tensor):
+        feat = self.conv(x)
+        return feat, self.pool(feat)
 
 
-class UpSample(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int):
+class Up(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
+        self.up = nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(out_ch * 2, out_ch)
 
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = torch.nn.functional.interpolate(
+                x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+            )
+        x = torch.cat([skip, x], dim=1)
+        return self.conv(x)
+    
+class TryOnGenerator(nn.Module):
+    """
+    Giris kanallari:
+    - agnostic: 3
+    - cloth: 3
+    - cloth_mask: 1
+    - pose: 3
+    Toplam: 10 kanal
+    """
 
-    def forward(self, x:torch.Tensor):
-        return self.up(x)
-
-
-
-## ANA MIMARI##
-"""Girdi olarak görüntüleri alan ve pixellerin hangi sınıflara ait olduğunu tahmmin eden bir segmantasyon çıkartır."""
-
-
-class UNet(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int):
+    def __init__(self, in_ch: int = 10, base: int = 64):
         super().__init__()
+        self.d1 = Down(in_ch, base)
+        self.d2 = Down(base, base * 2)
+        self.d3 = Down(base * 2, base * 4)
+        self.mid = ConvBlock(base * 4, base * 8)
+        self.u3 = Up(base * 8, base * 4)
+        self.u2 = Up(base * 4, base * 2)
+        self.u1 = Up(base * 2, base)
+        self.out = nn.Conv2d(base, 3, kernel_size=1)
+        self.tanh = nn.Tanh()
 
-        self.down_conv = nn.ModuleList([DoubleConvolution(i, o) for i, o in
-                                        [(in_channels, 64), (64, 128), (128, 256), (256, 512)]])
-        self.down_sample = nn.ModuleList([DownSample() for _ in range(4)])
-        self.mid_conv = DoubleConvolution(512, 1024)
-        self.up_sample = nn.ModuleList([UpSample(i, o) for i, o in
-                                        [(1024, 512), (512, 256), (256, 128), (128, 64)]])
-        self.up_conv = nn.ModuleList([DoubleConvolution(i, o) for i, o in
-                                      [(1024, 512), (512, 256), (256, 128), (128, 64)]])
-        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
-
-    def forward(self, x:torch.Tensor):
-        skip_connections = []
-
-        for down, pool in zip(self.down_conv, self.down_sample):
-            x = down(x)
-            skip_connections.append(x)
-            x = pool(x)
-
-        x = self.mid_conv(x)
-
-        skip_connections = skip_connections[::-1]
-
-        for idx in range(len(self.up_sample)):
-            x = self.up_sample[idx](x)
-            skip = skip_connections[idx]
-
-            if x.shape != skip.shape:
-                diffY = skip.size(2) - x.size(2)
-                diffX = skip.size(3) - x.size(3)
-                skip = skip[:, :, diffY // 2: diffY // 2 + x.size(2), diffX // 2: diffX // 2 + x.size(3)]
-
-            x = torch.cat((skip, x), dim=1)
-            x = self.up_conv[idx](x)
-
-        x = self.final_conv(x)
-        return x
-
-##model giriş ve çıkışlar
-model = UNet(3, 59)
-
-
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=5)
+    def forward(
+        self,
+        agnostic: torch.Tensor,
+        cloth: torch.Tensor,
+        cloth_mask: torch.Tensor,
+        pose: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([agnostic, cloth, cloth_mask, pose], dim=1)
+        s1, x = self.d1(x)
+        s2, x = self.d2(x)
+        s3, x = self.d3(x)
+        x = self.mid(x)
+        x = self.u3(x, s3)
+        x = self.u2(x, s2)
+        x = self.u1(x, s1)
+        x = self.out(x)
+        return self.tanh(x)
+    

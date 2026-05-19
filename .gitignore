@@ -8,3 +8,4 @@ seg_*
 /graphics
 
 train_*
+print.py
