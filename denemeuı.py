@@ -12,7 +12,7 @@ from kıyafetigiydir import warp_clothes
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-GENERATOR_PATH = "models/generator_2.pth"
+GENERATOR_PATH = "models/generator_3.pth"
 UNET_PATH = "models/unet_model_2.pth"
 SIZE = (256, 256)
 
@@ -134,6 +134,8 @@ def make_agnostic(person_bgr, pose_estimator, cloth_region_mask=None):
 
 def make_cloth_mask(cloth_bgr, unet_model):
     cloth_bgr = cv2.resize(cloth_bgr, SIZE)
+
+    # Önce UNet dene
     if unet_model is not None:
         cloth_rgb = cv2.cvtColor(cloth_bgr, cv2.COLOR_BGR2RGB)
         x = torch.from_numpy(cloth_rgb).permute(2, 0, 1).float() / 255.0
@@ -141,40 +143,59 @@ def make_cloth_mask(cloth_bgr, unet_model):
         with torch.no_grad():
             logits = unet_model(x)[0]
             pred = torch.argmax(logits, dim=0).cpu().numpy().astype(np.uint8)
-
         unique, counts = np.unique(pred, return_counts=True)
         freq = {int(k): int(v) for k, v in zip(unique, counts) if int(k) != 0}
         if freq:
             dominant = max(freq, key=freq.get)
             mask = np.where(pred == dominant, 255, 0).astype(np.uint8)
+            h, w = mask.shape
+            center = mask[h//4:3*h//4, w//4:3*w//4]
+            if np.sum(center) < np.sum(mask) * 0.25:
+                mask = cv2.bitwise_not(mask)
             kernel = np.ones((5, 5), np.uint8)
-            return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            # Maske makul görünüyorsa döndür
+            coverage = np.sum(mask > 0) / (h * w)
+            if 0.1 < coverage < 0.9:
+                return mask
 
-    gray = cv2.cvtColor(cloth_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Beyaz arkaplanli urun gorsellerinde foreground siyah cikabiliyor.
-    if np.mean(mask > 0) > 0.65:
-        mask = 255 - mask
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    # UNet başarısız olduysa arka plan rengine göre ayır
+    # Köşe piksellerinin ortalaması arka plan rengi
+    h, w = cloth_bgr.shape[:2]
+    corners = np.array([
+        cloth_bgr[0, 0], cloth_bgr[0, w-1],
+        cloth_bgr[h-1, 0], cloth_bgr[h-1, w-1]
+    ], dtype=np.float32)
+    bg_color = corners.mean(axis=0)
+
+    # Arka plana benzeyen pikselleri maskele
+    diff = np.abs(cloth_bgr.astype(np.float32) - bg_color).sum(axis=2)
+    mask = (diff > 30).astype(np.uint8) * 255
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return mask
 
 
 def run_inference(person_img, cloth_img, generator, unet_model, pose_estimator):
     person_bgr = pil_to_bgr(person_img)
-    cloth_bgr = pil_to_bgr(cloth_img)
+    cloth_bgr  = pil_to_bgr(cloth_img)
     person_bgr = cv2.resize(person_bgr, SIZE)
-    cloth_bgr = cv2.resize(cloth_bgr, SIZE)
+    cloth_bgr  = cv2.resize(cloth_bgr,  SIZE)
 
-    pose_bgr = make_pose_map(person_bgr, pose_estimator)
+    person_bgr = cv2.resize(person_bgr, SIZE)
+
+    pose_bgr   = make_pose_map(person_bgr, pose_estimator)
     cloth_mask = make_cloth_mask(cloth_bgr, unet_model)
 
-    # Kiyafeti pose'a gore oturt (app.py akisindaki gibi warp).
-    segmented_cloth = cv2.bitwise_and(cloth_bgr, cloth_bgr, mask=cloth_mask.astype(np.uint8))
+    segmented_cloth       = cv2.bitwise_and(cloth_bgr, cloth_bgr, mask=cloth_mask.astype(np.uint8))
     keypoints_and_landmarks = pose_estimator.get_keypoints(person_bgr)
-    warped_cloth = segmented_cloth
-    warped_mask = cloth_mask
+    st.write(f"Pose tespit: {keypoints_and_landmarks is not None}")
+    warped_cloth, warped_mask = segmented_cloth, cloth_mask
+
     if keypoints_and_landmarks is not None:
-        keypoints, _ = keypoints_and_landmarks
+        keypoints, _ = keypoints_and_landmarks  # BU SATIR EKSİK
+        st.write(f"Keypoint sayısı: {len(keypoints)}")
         try:
             wc, wm = warp_clothes(
                 person_bgr,
@@ -185,35 +206,47 @@ def run_inference(person_img, cloth_img, generator, unet_model, pose_estimator):
             )
             if wc is not None and wm is not None:
                 warped_cloth, warped_mask = wc, wm
-        except Exception:
-            pass
+        except Exception as e:
+            st.error(f"Warp hatası: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
-        # Warp tasmasini azalt: maske alanini torso ROI ile sinirla.
         try:
             ls = keypoints[11][:2].astype(np.int32)
             rs = keypoints[12][:2].astype(np.int32)
             lh = keypoints[23][:2].astype(np.int32)
             rh = keypoints[24][:2].astype(np.int32)
             torso_poly = np.array([ls, rs, rh, lh], dtype=np.int32)
-            torso_roi = np.zeros_like(warped_mask, dtype=np.uint8)
+            torso_roi  = np.zeros_like(warped_mask, dtype=np.uint8)
             cv2.fillConvexPoly(torso_roi, torso_poly, 255)
-            torso_roi = cv2.dilate(torso_roi, np.ones((21, 21), np.uint8), iterations=1)
-            warped_mask = cv2.bitwise_and(warped_mask.astype(np.uint8), torso_roi)
+            torso_roi    = cv2.dilate(torso_roi, np.ones((21, 21), np.uint8), iterations=1)
+            warped_mask  = cv2.bitwise_and(warped_mask.astype(np.uint8), torso_roi)
             warped_cloth = cv2.bitwise_and(warped_cloth, warped_cloth, mask=warped_mask)
         except Exception:
             pass
 
     agnostic_bgr = make_agnostic(person_bgr, pose_estimator, cloth_region_mask=warped_mask)
 
-    agnostic = norm_transform(
-        Image.fromarray(cv2.cvtColor(agnostic_bgr, cv2.COLOR_BGR2RGB))
-    ).unsqueeze(0).to(DEVICE)
-    cloth = norm_transform(
-        Image.fromarray(cv2.cvtColor(warped_cloth, cv2.COLOR_BGR2RGB))
-    ).unsqueeze(0).to(DEVICE)
-    pose = norm_transform(
-        Image.fromarray(cv2.cvtColor(pose_bgr, cv2.COLOR_BGR2RGB))
-    ).unsqueeze(0).to(DEVICE)
+    # ── DEBUG GÖRSELLERİ ─────────────────────────────────────────────
+    st.subheader("Debug Görseller")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.caption("Pose Map")
+        st.image(cv2.cvtColor(pose_bgr, cv2.COLOR_BGR2RGB))
+    with col2:
+        st.caption("Cloth Mask")
+        st.image(cloth_mask)
+    with col3:
+        st.caption("Warped Cloth")
+        st.image(cv2.cvtColor(warped_cloth, cv2.COLOR_BGR2RGB))
+    with col4:
+        st.caption("Agnostic")
+        st.image(cv2.cvtColor(agnostic_bgr, cv2.COLOR_BGR2RGB))
+    # ─────────────────────────────────────────────────────────────────
+
+    agnostic = norm_transform(Image.fromarray(cv2.cvtColor(agnostic_bgr, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
+    cloth    = norm_transform(Image.fromarray(cv2.cvtColor(warped_cloth, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
+    pose     = norm_transform(Image.fromarray(cv2.cvtColor(pose_bgr,     cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
 
     cloth_mask_tensor = torch.from_numpy(warped_mask).float().unsqueeze(0).unsqueeze(0) / 255.0
     cloth_mask_tensor = cloth_mask_tensor.to(DEVICE)
@@ -221,36 +254,26 @@ def run_inference(person_img, cloth_img, generator, unet_model, pose_estimator):
     with torch.no_grad():
         output = generator(agnostic, cloth, cloth_mask_tensor, pose)
 
-    # Model artefaktlarini azaltmak icin ciktiyi sadece kiyafet bolgesinde uygula.
-    gen_rgb = np.array(tensor_to_image(output).convert("RGB"))
     person_rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
 
-    mask = warped_mask.astype(np.uint8)
-    if mask.shape[:2] != person_rgb.shape[:2]:
-        mask = cv2.resize(mask, (person_rgb.shape[1], person_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+    gen_rgb = np.array(tensor_to_image(output).convert("RGB"))
 
-    # Kenarlari yumusat: sert sinir ve iskelet izi etkisini azaltir.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-    alpha = cv2.GaussianBlur(mask, (0, 0), sigmaX=3, sigmaY=3).astype(np.float32) / 255.0
-    alpha = np.expand_dims(alpha, axis=2)
+    # BUNU EKLE — GAN çıktısı yerine direkt warped cloth kullan
+    gen_rgb = cv2.cvtColor(warped_cloth, cv2.COLOR_BGR2RGB)
+    gen_rgb = cv2.resize(gen_rgb, (person_rgb.shape[1], person_rgb.shape[0]))
+    
 
-    blended = (alpha * gen_rgb + (1.0 - alpha) * person_rgb).clip(0, 255).astype(np.uint8)
+    torso_only_mask = cv2.erode(warped_mask, np.ones((3, 3), np.uint8), iterations=2)
+    alpha = cv2.GaussianBlur(torso_only_mask, (21, 21), sigmaX=7).astype(np.float32) / 255.0
+    alpha = np.expand_dims(alpha, 2)
+    blended = (alpha * gen_rgb + (1 - alpha) * person_rgb).clip(0, 255).astype(np.uint8)
 
-    # Pose cizgilerinden gelen yesil artefakti bastir.
     r = blended[:, :, 0].astype(np.int16)
     g = blended[:, :, 1].astype(np.int16)
     b = blended[:, :, 2].astype(np.int16)
     green_artifact = (g > 115) & (g - r > 28) & (g - b > 20)
     blended[green_artifact] = person_rgb[green_artifact]
 
-        # Mevcut blend yerine şunu kullan:
-    # Generator çıktısını sadece torso bölgesine uygula
-    # Yüz, eller, bacaklar orijinalden gelsin
-
-    torso_only_mask = cv2.erode(warped_mask, np.ones((3,3), np.uint8), iterations=2)
-    alpha = cv2.GaussianBlur(torso_only_mask, (21, 21), sigmaX=7).astype(np.float32) / 255.0
-    alpha = np.expand_dims(alpha, 2)
-    blended = (alpha * gen_rgb + (1 - alpha) * person_rgb).clip(0, 255).astype(np.uint8)
     return Image.fromarray(blended)
 
 
@@ -279,8 +302,13 @@ if person_file and cloth_file:
         st.warning("MediaPipe Pose mevcut degil. Pose haritasi bos tensor olarak kullanilacak.")
 
     if st.button("Modeli Calistir"):
-        result = run_inference(
-            person_img, cloth_img, generator, unet_model, pose_estimator
-        )
-        st.subheader("Sonuc")
-        st.image(result, width="stretch")
+        try:
+            result = run_inference(
+                person_img, cloth_img, generator, unet_model, pose_estimator
+            )
+            st.subheader("Sonuc")
+            st.image(result, width="stretch")
+        except Exception as e:
+            st.error(f"Hata: {e}")
+            import traceback
+            st.code(traceback.format_exc())

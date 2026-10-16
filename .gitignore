@@ -7,5 +7,7 @@ seg_*
 /logs
 /graphics
 
-train_*
+
 print.py
+
+kurtarma_history.py
