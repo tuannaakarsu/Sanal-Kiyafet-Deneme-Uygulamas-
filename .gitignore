@@ -11,3 +11,15 @@ seg_*
 print.py
 
 kurtarma_history.py
+
+.venv
+/scratch
+/.vscode
+/__pycache__
+datasets.zip
+gan_gecis_plani.md
+gan.ipynb
+colab_unet_binary_segmentasyon.ipynb
+colab_vton_gan_egitim.ipynb
+gan.ipynb
+tumkatalog*

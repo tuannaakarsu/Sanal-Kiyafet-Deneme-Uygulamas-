@@ -2,12 +2,18 @@ from oneri import oneri_uret
 import os
 import uuid
 import datetime
-from flask_cors import CORS
 from anakod import run_virtual_tryon_auto
+# pyrefly: ignore[missing-import]
 from flask import Flask ,request, jsonify , send_file , send_from_directory , make_response
+from flask_cors import CORS
 
 app = Flask(__name__ , static_folder='tumkatalog')
 CORS(app)
+os.makedirs("temp", exist_ok=True)
+
+@app.route('/')
+def home():
+    return jsonify({"status": "running", "message": "Flask sunucusu başarıyla çalışıyor!"}), 200
 
 @app.route('/vton', methods=['POST'])
 def vton():
@@ -69,7 +75,7 @@ def serve_images(filename):
     return send_from_directory('tumkatalog', filename)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
 
 
 

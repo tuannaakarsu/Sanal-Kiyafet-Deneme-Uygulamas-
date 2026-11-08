@@ -1,0 +1,15 @@
+flask
+flask-cors
+opencv-python
+pillow
+torch
+torchvision
+mediapipe<=0.10.14
+albumentations
+scikit-learn
+pandas
+numpy
+matplotlib
+tqdm
+sympy
+streamlit
